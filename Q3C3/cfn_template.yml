@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Q3 – Bonus Challenge 3: Serverless Application Deployment"
+Parameters:
+  MyDomainName:
+    Description: 'The domain name for the website'
+    Type: 'String'
+  CertificateVirginia:
+    Description: 'The ARN of the ACM certificate'
+    Type: 'String'
+  HostedZone:
+    Description: 'The ID of the Hosted Zone'
+    Type: 'String'
+
+
+Resources:
+  StaticBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-static
+      AccessControl: Private
+
+  CloudFrontOAI:
+    Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: Access S3 bucket content only via CloudFront
+
+  StaticBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref StaticBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${StaticBucket}/*'
+
+  CloudFront:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${AWS::StackName} static files
+        Origins:
+          - DomainName: !GetAtt [StaticBucket, RegionalDomainName]
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CloudFrontOAI}
+          - DomainName: !Sub "${ApiGateway}.execute-api.eu-west-1.amazonaws.com"
+            Id: ApiGatewayOrigin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        Enabled: true
+        Aliases:
+          - !Ref MyDomainName
+        HttpVersion: http2
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad' # Managed-CachingDisabled
+          #CachePolicyId: '658327ea-f89d-4fab-a63d-7e88639e58f6' # Managed-CachingOptimized
+          #OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf' # CORS-S3Origin
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiGatewayOrigin
+            AllowedMethods:
+              - HEAD
+              - DELETE
+              - POST
+              - GET
+              - OPTIONS
+              - PUT
+              - PATCH
+            ForwardedValues:
+              QueryString: true
+              Headers:
+                - Authorization
+            ViewerProtocolPolicy: redirect-to-https
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          #CloudFrontDefaultCertificate: true
+          AcmCertificateArn: !Ref CertificateVirginia
+          SslSupportMethod: 'sni-only' # or 'vip'
+          MinimumProtocolVersion: 'TLSv1.1_2016' # optional
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 403
+            ResponsePagePath: /error.html
+
+  DynamoDbTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub ${AWS::StackName}-profile
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+### Crud DynamoDb Lambda Function
+  CrudLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-crud-dynamodb-table
+      Description: Read from dynamodb.
+      Runtime: nodejs18.x
+      Role: !GetAtt 'CrudLambdaExecutionRole.Arn'
+      Handler: index.handler
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref DynamoDbTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");  
+          const { DynamoDBDocumentClient, ScanCommand, PutCommand, GetCommand, DeleteCommand } = require("@aws-sdk/lib-dynamodb"); 
+          const client = new DynamoDBClient({});
+          const dynamo = DynamoDBDocumentClient.from(client);
+          const tableName = process.env.DYNAMODB_TABLE;
+          module.exports.handler = async (event, context) => {
+            console.log(event.requestContext.authorizer?.jwt);
+            let body;
+            let statusCode = 200;
+            const headers = {
+              "Content-Type": "application/json",
+            };
+
+            try {
+              switch (event.routeKey) {
+                case "DELETE /api/items/{id}":
+                  await dynamo.send(
+                    new DeleteCommand({
+                      TableName: tableName,
+                      Key: {
+                        id: event.pathParameters.id,
+                      },
+                    })
+                  );
+                  body = `Deleted item ${event.pathParameters.id}`;
+                  break;
+                case "GET /api/items/{id}":
+                  body = await dynamo.send(
+                    new GetCommand({
+                      TableName: tableName,
+                      Key: {
+                        id: event.pathParameters.id,
+                      },
+                    })
+                  );
+                  body = body.Item;
+                  break;
+                case "GET /api/items":
+                  body = await dynamo.send(
+                    new ScanCommand({ TableName: tableName })
+                  );
+                  body = body.Items;
+                  break;
+                case "PUT /api/items":
+                  let requestJSON = JSON.parse(event.body);
+                  await dynamo.send(
+                    new PutCommand({
+                      TableName: tableName,
+                      Item: {
+                        id: requestJSON.id,
+                        price: requestJSON.price,
+                        name: requestJSON.name,
+                      },
+                    })
+                  );
+                  body = `Put item ${requestJSON.id}`;
+                  break;
+                default:
+                  throw new Error(`Unsupported route: "${event.routeKey}"`);
+              }
+            } catch (err) {
+              statusCode = 400;
+              body = err.message;
+            } finally {
+              body = JSON.stringify(body);
+            }
+
+            return {
+              statusCode,
+              body,
+              headers,
+            };
+          };
+
+      TracingConfig:
+        Mode: Active
+
+  CrudLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'dynamodb:*'
+            Resource: '*'
+
+  CrudLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt 'CrudLambdaFunction.Arn'
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+
+### Cognito
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-userpool
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        #- Name: name
+        #  Required: true
+        #  Mutable: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      UserPoolAddOns:
+        AdvancedSecurityMode: "ENFORCED"
+
+  UserPoolDomain:
+    Type: "AWS::Cognito::UserPoolDomain"
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub ${AWS::StackName}
+
+  UserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client
+      UserPoolId: !Ref UserPool
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+      CallbackURLs:
+        - !Join ['', ['https://', !GetAtt [CloudFront, DomainName], '/callback.html']]
+        - "http://localhost:8080/callback.html"
+      DefaultRedirectURI: !Join ['', ['https://', !GetAtt [CloudFront, DomainName], '/callback.html']]
+      GenerateSecret: false
+      LogoutURLs:
+        - !Join ['', ['https://', !GetAtt [CloudFront, DomainName], '/index.html']]
+        - "http://localhost:8000/index.html"
+      SupportedIdentityProviders:
+        - COGNITO
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: hours
+      IdTokenValidity: 5
+      AccessTokenValidity: 5
+      RefreshTokenValidity: 1
+
+  CognitoIdentityPool:
+    Type: 'AWS::Cognito::IdentityPool'
+    Properties:
+      IdentityPoolName: !Sub ${AWS::StackName}-identity
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+      AllowUnauthenticatedIdentities: false
+
+### Access Token Exchange Lambda Function
+  TokenExchangeLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-exchange-access-token
+      Description: Exchange code to access tokens.
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt TokenExchangeLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          CLIENT_ID: !Ref UserPoolClient
+          REDIRECT_URI: !Join ['', ['https://', !GetAtt [CloudFront, DomainName], '/callback.html']]
+          USER_POOL_DOMAIN: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+      Code:
+        ZipFile: |
+          import os
+          import urllib.parse  
+          import urllib.request  
+          import json  
+
+          def lambda_handler(event, context):  
+              print(event)
+              body = json.loads(event['body'])  
+              code = body['code']
+
+              token_url = os.environ['USER_POOL_DOMAIN'] + '/oauth2/token'
+              payload = {  
+                  'grant_type': 'authorization_code',  
+                  'client_id': os.environ['CLIENT_ID'],  
+                  'code': code,  
+                  'redirect_uri': os.environ['REDIRECT_URI']  
+              }  
+              data = urllib.parse.urlencode(payload).encode('ascii')  
+              req = urllib.request.Request(token_url, data)  
+              try:
+                  with urllib.request.urlopen(req) as response:  
+                      status_code = response.getcode()  
+                      if status_code == 200:  
+                          token_data = json.load(response)  
+                          access_token = token_data.get('access_token')  
+                          id_token = token_data.get('id_token')  
+                          refresh_token = token_data.get('refresh_token')  
+                          if access_token and id_token and refresh_token:  
+                              # Tokens are present and valid, perform additional validation if needed  
+                              return {  
+                                  'access_token': access_token,  
+                                  'id_token': id_token,  
+                                  'refresh_token': refresh_token  
+                              }
+              except Exception as e:
+                  print(e)
+                  # Handle any validation errors or unexpected responses  
+                  return None  
+
+  TokenExchangeLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TokenExchangeLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt 'TokenExchangeLambdaFunction.Arn'
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+
+### Api Gateway
+  ApiGateway:
+    Type: 'AWS::ApiGatewayV2::Api'
+    Properties:
+      Name: !Sub ${AWS::StackName}-api-gateway
+      ProtocolType: HTTP
+      RouteSelectionExpression: '${request.method} ${request.path}'
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+          #- !Join ['', ['https://', !GetAtt [CloudFront, DomainName]]]
+          #- https://d22ycuc2smyg2j.cloudfront.net
+        AllowHeaders:
+          - '*'
+        AllowMethods:
+          - OPTIONS
+          - GET
+          - POST
+          - PUT
+          - DELETE
+
+  ApiGatewayIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations'
+        - Arn: !GetAtt 'CrudLambdaFunction.Arn'
+      PayloadFormatVersion: '2.0'
+
+  GetItemsRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /api/items
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Target: !Join
+        - /
+        - - 'integrations'
+          - !Ref ApiGatewayIntegration
+
+  GetItemRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'GET /api/items/{id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ApiGatewayIntegration
+
+  DeleteItemRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'DELETE /api/items/{id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ApiGatewayIntegration
+
+  PutItemRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'PUT /api/items'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ApiGatewayIntegration
+
+  ApiGatewayDeployment:
+    Type: 'AWS::ApiGatewayV2::Deployment'
+    DependsOn: GetItemsRoute
+    Properties:
+      ApiId: !Ref ApiGateway
+
+  ApiGatewayLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub ${AWS::StackName}-api-gateway-logs
+      RetentionInDays: 14
+
+  ApiGatewayDefaultStage:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      ApiId: !Ref ApiGateway
+      AutoDeploy: true
+      StageName: '$default'
+      Description: Default Stage that auto-deploys
+      #DeploymentId: !Ref ApiGatewayDeployment
+
+
+  ApiGatewayAuthorizer:
+    Type: 'AWS::ApiGatewayV2::Authorizer'
+    Properties:
+      ApiId: !Ref ApiGateway
+      Name: !Sub ${AWS::StackName}-${UserPool}-authorizer
+      AuthorizerType: JWT
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+
+  TokenExchangeApiIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations'
+        - Arn: !GetAtt 'TokenExchangeLambdaFunction.Arn'
+      PayloadFormatVersion: '2.0'
+
+  TokenExchangeApiRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: POST /token
+      Target: !Join
+        - /
+        - - 'integrations'
+          - !Ref TokenExchangeApiIntegration
+
+  RecordSet:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub ${DomainName}.
+      Type: CNAME
+      TTL: '60'
+      ResourceRecords:
+        - !GetAtt CloudFront.DomainName
+
+
+Outputs:
+  UserPoolDomain:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  CloudFrontDomain:
+    Value: !Join ['', ['https://', !GetAtt [CloudFront, DomainName]]]
+  UserPoolClient:
+    Value: !Ref UserPoolClient
+  ApiGateway:
+    Value: !Sub "https://${ApiGateway}.execute-api.eu-west-1.amazonaws.com"
+  StaticBucket:
+    Value: !Ref StaticBucket
+  UserPool:
+    Value: !Ref UserPool
